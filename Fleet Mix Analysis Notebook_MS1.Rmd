@@ -1,0 +1,427 @@
+---
+title: "Trial Optimization Results Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+This is a "guided" analysis of the results from the optimization for Mission Scenario 1. As a reminder, Mission Scenario 1 is defined by:
+
+* Distance: 200 nm - 1500 nm
+
+* Lift Requirement: 10 stons - 200 stons
+
+* Trucking Distance: 10 mi - 100 mi
+
+The below results come from a 170 iteration run with up to 120 replications per iteration.
+
+```{r}
+# Initialization
+needed_packages <- c("sqldf", "ggplot2", "scales", "ggforce", "corrplot")
+new_packages <- needed_packages[!(needed_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+suppressWarnings(library(sqldf))
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(scales))
+suppressWarnings(library(ggforce))
+suppressWarnings(library(corrplot))
+setwd("C:/Users/Austin.Fligor/Desktop/HeliCarrier Project")
+```
+
+```{r}
+# Load data
+
+# Fleet mix composition
+fm <- read.csv("MS1_FleetMix.csv")
+
+# Results (MOEs & MOPs)
+results <- read.csv("MS1_ResultsSummary.csv")
+colnames(results) <- gsub(".", "", c(colnames(results)), fixed=TRUE)
+```
+
+The below query pulls the average and half-width of the responses, closure time and cost, from the results dataframe for each iteration and appends them to a new dataframe.
+```{r}
+responses_df <- sqldf("SELECT CT.Scenario AS Iteration, CT.Average As 'MissionClosure', CT.HalfWidth AS 'MissionClosure_HW', 
+                       C.Average As 'MissionCost', C.HalfWidth AS 'MissionCost_HW'
+                       FROM 
+                       (SELECT Scenario, DataSource, Average, HalfWidth FROM results
+                       WHERE DataSource = 'MissionClosureTime') CT, 
+                       (SELECT Scenario, DataSource, Average, HalfWidth FROM results 
+                       WHERE DataSource = 'MissionCost') C
+                       WHERE Iteration = C.Scenario;")
+responses_df[,1:ncol(responses_df)] <- sapply(responses_df[,1:ncol(responses_df)], as.numeric)
+responses_df[,c("MissionClosure", "MissionClosure_HW")] <- responses_df[,c("MissionClosure", "MissionClosure_HW")]/24
+```
+
+Let's first plot the solutions along both response dimensions to see what they look like. Note that closure time is in days and cost is in dollars.
+```{r}
+# Plot all solutions
+ggplot(responses_df, aes(x = MissionClosure, y = MissionCost)) +
+  geom_point() + xlab("Closure Time (days)") + ylab("Cost ($)") + ggtitle("Cost vs. Closure Time") + theme(text = element_text(size = 13))
+```
+
+
+We are interested in the non-dominated solutions; so, I will isolate them and re-plot the data with the frontier shown (red line).
+```{r}
+# Run algorithm to isolate non-dominated solutions
+sorted_df <- responses_df[order(responses_df$MissionClosure, responses_df$MissionCost, decreasing = FALSE),]
+pareto_df <- sorted_df[1,]
+for (i in 2:nrow(fm)) {
+  append <- TRUE
+  for (c in pareto_df$MissionCost)
+    if (sorted_df[i, "MissionCost"] >= c) {
+      append <- FALSE
+    }
+  if (append == TRUE) {
+    pareto_df <- rbind(pareto_df, sorted_df[i,])
+  }
+}
+
+# Plot solutions showing pareto frontier
+ggplot(responses_df, aes(x = MissionClosure, y = MissionCost)) +
+  geom_point() + xlab("Closure Time (days)") + ylab("Cost ($)") + ggtitle("Cost vs. Closure Time") + 
+  geom_line(data = pareto_df, aes(x = MissionClosure, y = MissionCost), color = "red") + theme(text = element_text(size = 13))
+```
+
+
+There are 11 non-dominated solutions. I'll go ahead and plot them in isolation to get a closer look.
+```{r}
+# Plot cost vs closure time of non-dominated solutions
+pareto_plt <- ggplot(pareto_df, aes(x = MissionClosure, y = MissionCost)) +
+              geom_point() +
+              geom_text(aes(label = Iteration), position = position_dodge(width = 0.1), hjust = -0.25, vjust = -0.25) +
+              xlab('Closure Time (days)') + ylab('Cost ($)') + ggtitle("Cost vs. Closure Time") + theme(text = element_text(size = 13))
+suppressWarnings(print(pareto_plt))
+```
+
+
+The number next to each point on the plot is the iteration for which the solution was computed. The iteration number could be viewed as an index, or unique identifier, for a fleet mix. Iteration 14 resulted in the fastest closure time, and iteration 157 was the most-cost efficient option. Some of these points are only marginal improvements on one another. It would be easier to compare and contrast these results if they were categorized in some way. This would be a good application for clustering. Using kmeans, I'll start with 3 cluster centers, but I will go back and check to see if a different number of centers would be better.
+```{r}
+# Cluster non-dominated solutions
+set.seed(1)
+pareto_km <- kmeans(pareto_df[,c("MissionClosure", "MissionCost")], centers = 3, nstart = 10)
+
+clusters <- pareto_km$cluster
+clusters_df <- cbind(pareto_df, clusters)
+clusters_df
+
+# Visualize clusters
+clstr_plt <- ggplot(clusters_df, aes(x = MissionClosure, y = MissionCost, color = factor(clusters))) +
+              geom_point() +
+              geom_text(aes(label = Iteration), show.legend = FALSE, position = position_dodge(width = 0.1), hjust = -0.25, vjust = -0.25) +
+              xlab('Closure Time (days)') + ylab('Cost ($)') + labs(color = 'Cluster') + ggtitle("Cost vs. Closure Time") + theme(text = element_text(size = 13))
+suppressWarnings(print(clstr_plt))
+
+#scale_color_manual(labels = c("1 - Cost-Efficient", "2 - Fast", "3 - Balanced"), values = c("salmon", "limegreen", "steelblue2"))
+```
+
+
+The output dataframe shows the iteration number, response values, and assigned cluster. The cluster column, called "clusters," simply indicates which cluster the solution was assigned to. Three clusters looks like a decent way to separate the data, but I'll go ahead and test to see what kind of marginal benefit there is in increasing the number of cluster centers. I will be using within-cluster sum of squares (WCSS) as the measure for model fit (lower is better). A good way to visualize model improvement is with an elbow diagram; so, the below block of code will output that diagram.
+```{r}
+# Function to run kmeans algorithm. Takes input for number of cluster centers to use.
+run_kmeans <- function(c) {
+  set.seed(1)
+  m <- kmeans(pareto_df[,c("MissionClosure", "MissionCost")], centers = c, nstart = 10)
+  ss <- m$tot.withinss
+  return(ss)
+}
+
+# Find "optimal" number of clusters
+k_vec <- c()
+wcss_vec <- c()
+for (k in 1:(nrow(pareto_df)-1)) {
+  wcss <- run_kmeans(k)
+  k_vec[k] <- k
+  wcss_vec[k] <- wcss
+}
+
+# Plot elbow diagram
+kmeans_perf <- as.data.frame(cbind(k_vec, wcss_vec))
+ggplot(kmeans_perf, aes(k_vec, wcss_vec)) + labs(x = "k", y = "Total within-cluster sum of squares") +
+  geom_point() + geom_line() + scale_x_continuous(breaks = pretty_breaks()) +
+  theme(text = element_text(size = 13))
+```
+
+
+3 clusters seems to make the most sense. There is not much marginal improvement after 3 cluster centers. I'll stick with the original model.
+
+Some early takeaways:
+
+* Cluster 1 contains the most cost-efficient solutions.
+
+* Cluster 2 contains the most effective solutions (fastest closure times).
+
+* Cluster 3 seem to provide a balanced tradeoff.
+
+* Iteration 161 is just barely a non-dominated solution. Moving from 161 to 27, there is almost no *visual* difference in closure time. Because of this, even though 161 is mathematically non-dominated, there is little practical benefit in its selection.
+
+* It is easier to view and contrast the solutions in terms of a group as opposed to individually. Having these clusters will be helpful later on when we take a look at the fleet mixes themselves and try to attribute mission performance to the type of asset used.
+
+Next, it might be useful to explore how the fleet mixes of these non-dominated solutions were allocated. It is only so useful to see these results, and not know which assets are responsible for them. I will merge the fleet mix dataframe with the responses dataframe for the 11 non-dominated solutions to relate fleet composition to the responses. Note that assets not present in any of the non-dominated solutions have been excluded.
+```{r}
+fleets <- merge(fm, clusters_df, by = "Iteration")
+fleets <- fleets[, colSums(fleets != 0) > 0]
+fleets <- fleets[order(fleets$MissionClosure, fleets$MissionCost, decreasing = FALSE),]
+fleets
+```
+
+
+The fastest solution used 1 C-5 and 2 C-17s. The closure time was about 0.63 days and cost about \$146,000. The most cost-efficient solution used 2 90T-4 airships. The closure time was 2.2 days and cost about \$51,000. The trade here is very clear. The cost decreases by a factor of about 2.9, but the closure time increases by a factor of about 3.5. This is not a perfectly linear trade, but this doesn’t mean there isn’t value in the cheaper option. In general, it would be useful to understand the relationship each asset has with the response values. The below charts show the two-way correlation between every asset and the responses. Measured by the asset-response pair correlation coefficient, a larger magnitude of the correlation coefficient means that the response and its value has a stronger relationship with the asset and its value. The correlation coefficient is bounded between -1 and 1. A strong positive relationship is indicated by a correlation coefficient close to 1, and a strong negative relationship is indicated by a correlation coefficient close to -1. A correlation coefficient close to 0 indicates that there is little-to-no relationship.
+```{r}
+corrs <- cor(fleets[, -c(1, (ncol(fleets)-3), (ncol(fleets)-1):ncol(fleets))])
+#corrplot(corrs, type = "upper", tl.col = "black", col=colorRampPalette(c("green3","white","firebrick2"))(200))
+ggplot(stack(corrs[1:(nrow(corrs)-2), "MissionClosure"]), aes(x = reorder(ind, values, FUN = sum), y = values, fill = values)) +
+  geom_bar(stat = "identity") + scale_fill_gradient(low = "green", high = "red") +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) + xlab("Asset") + ylab("Correlation Coefficient") + labs(fill = "Correlation Coefficient") + 
+  ggtitle("Asset Correlation to Closure Time") + theme(text = element_text(size = 12))
+
+ggplot(stack(corrs[1:(nrow(corrs)-2), "MissionCost"]), aes(x = reorder(ind, values, FUN = sum), y = values, fill = values)) +
+  geom_bar(stat = "identity") + scale_fill_gradient(low = "green", high = "red") +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) + xlab("Asset") + ylab("Correlation Coefficient") + labs(fill = "Correlation Coefficient") + 
+  ggtitle("Asset Correlation to Cost") + theme(text = element_text(size = 12))
+```
+
+
+While you need to be careful in what you imply based on an observed relationship, these are important relationships to observe. In a simulation environment, we can control many of the confounding and unknown influences on the response. Additionally, it is well understood that the fleet chosen will have an impact of the closure time and cost of a mission. Therefore, when looking at these correlations, it is probably safe to say there is some causal relationship; however, we will not attempt to quantify to what extent the relationship is causal. The C-17 has the strongest correlation to cost and closure time. It is strongly negatively correlated with closure time, and strongly positively correlated with cost. This is expected. The C-5 shadows the C-17's correlations with lower magnitude. The next most prominent correlations appear to be with the 90T-4 airship and the 180T-4 airship. For the airships, the correlation is opposite that of the C-17 and C-5. The number of airships is positively correlated with closure time and negatively correlated with cost. The magnitude of correlation is similar to the C-5's magnitude of correlation. The 90T-3 airship actually has a negative correlation with closure time and positive correlation with cost. However, the overall correlation is low.
+
+With this mission scenario, most of the intuitive relationships we expect between the assets and closure time and cost are observed. However, when the bigger missions start getting run where more complexities are present such as longer trucking distance, more assets in a fleet, or more opportunities for broken aircraft, the correlation may shift to something that is a bit less intuitive. So, this plot may be good to look out for in the future.
+
+It appears that the C-17 is the most common asset; however, it would probably be easier to look at the asset distribution with a visualization.
+```{r}
+asset_occ <- data.frame(Iteration = integer(), Asset = character(), Occ = integer(), Cluster = integer())
+for (i in 1:nrow(fleets)) {
+  it <- fleets[i, "Iteration"]
+  for (j in 2:(ncol(fleets)-5)) {
+    if (fleets[i, j] > 0) {
+      asset <- colnames(fleets[j])
+      clstr <- fleets[i, "clusters"]
+      asset_occ <- rbind(asset_occ, c(it, asset, 1, clstr))
+    }
+  }
+}
+colnames(asset_occ) <- c("Iteration", "Asset", "Occ", "Cluster")
+asset_occ$Iteration <- as.integer(asset_occ$Iteration)
+asset_occ$Occ <- as.integer(asset_occ$Occ)
+asset_occ$Cluster <- as.integer(asset_occ$Cluster)
+
+ggplot(asset_occ, aes(x = reorder(Asset, -Occ, FUN = sum), y = Occ, fill = factor(Cluster))) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  #scale_x_discrete(guide = guide_axis(n.dodge = 2)) + 
+  scale_y_continuous(breaks = pretty_breaks()) +
+  xlab("Asset") + ylab("Number of Occurences") + labs(fill = 'Cluster') + ggtitle("Asset Occurence") + theme(text = element_text(size = 13))
+```
+
+
+This is the first instance of the clusters being helpful for contextualization. This chart shows the number of times each asset was included in a fleet mix, and we can also see where the inclusion occurred in terms of the cluster. The C-17 is in nine out of eleven fleet mixes. The C-17 is in every fleet mix in Cluster 2, the fast cluster, and Cluster 3, the balanced cluster; it is not present in Cluster 1, the cost-efficient cluster. The next highest occurring assets are the 90T-3 and 90T-4, each in four fleet mixes. There are a total of eight fleet mixes with a 90T variant. All 90T variants here use 80% of their payload for cargo. The 90T-3 cruises at 63 knots, and the 90T-4 cruises at 50 knots. The clusters each airship is in makes sense. The the -3 is predominately in the balanced cluster with one occurrence in the fast cluster; and, the -4 is predominately in the balanced cluster with one occurrence in the cost-efficient cluster. The 90T-3 and -4 make up the airships in the balanced cluster. This means some combination of a pairing of between a C-17 and 90T-3 or -4 airships comprise the balanced fleet mixes. The C-5 is in three fleet mixes in Cluster 2. Fleet mixes with the 90T-4 and 180T-4 airships make up Cluster 1. This is the only occurrence of the 180T-4 airship. The C-17, 90T-3, and 90T-4 appear to be the three most robust assets here. I'm now going to look at how many of each asset was allocated to a fleet any time it was selected. The easiest way to visualize this is probably with a histogram.
+```{r}
+# C-17 histogram
+ggplot(fleets, aes(factor(fleets[,"NumC17"]), fill = factor(clusters))) +
+  geom_bar() + scale_y_continuous(breaks = pretty_breaks()) + xlab("Number in Fleet Mix") + ylab("Frequency") + 
+  labs(fill = "Cluster") + ggtitle("Histogram of C-17 Fleet Mix Allocation") + theme(text = element_text(size = 13))
+
+# A-90T-3 histogram
+ggplot(fleets, aes(factor(fleets[,"NumA_90T_3"]), fill = factor(clusters))) +
+  geom_bar() + scale_y_continuous(breaks = pretty_breaks()) + xlab("Number in Fleet Mix") + ylab("Frequency") + 
+  labs(fill = "Cluster") + ggtitle("Histogram of A-90T-3 Fleet Mix Allocation") + theme(text = element_text(size = 13))
+
+# A-90T-4 histogram
+ggplot(fleets, aes(factor(fleets[,"NumA_90T_4"]), fill = factor(clusters))) +
+  geom_bar() + scale_y_continuous(breaks = pretty_breaks()) + xlab("Number in Fleet Mix") + ylab("Frequency") + 
+  labs(fill = "Cluster") + ggtitle("Histogram of A-90T-4 Fleet Mix Allocation") + theme(text = element_text(size = 13))
+```
+
+
+The C-17 is in six fleet mixes with two units and three fleet mixes with one unit. Again, we see that the C-17 was not in any of the Cluster 3 fleet mixes. The A-90T-3 is in two fleet mixes with two units and two fleet mixes with one unit. Two units were allocated twice in Cluster 3, and one unit was allocated once in Cluster 2 and once in Cluster 3. The A-90T-4 is in three fleet mixes with two units and one fleet mix with one unit. Two units were allocated once in Cluster 1 and twice in Cluster 3, and one unit was allocated once in Cluster 3. It appears transitioning from configuration 3 to configuration 4 of the 90T airship presents a useful trade in speed for more cost-savings.
+
+At this point, fleet composition and its relationship with the responses is better understood. We have only been looking at the point estimates up to now, however. Using the confidence intervals (CI) of the non-dominated solutions, we can begin to explore which solutions may be statistically equivalent in each response dimension. The below cell will visualize the non-dominated solutions for each response individually, in increasing order. A discrete color scale is applied to differentiate between solutions that are the "best" (lowest) among other indifferent solutions.
+```{r}
+close_dif <- c()
+i <- 0
+for (it in pareto_df$Iteration) {
+  i <- i + 1
+  if (i == 1) {
+    close_dif[i] <- TRUE
+    last_it <- it
+  } 
+  else {
+    if ((pareto_df[pareto_df$Iteration == it, ]$MissionClosure - pareto_df[pareto_df$Iteration == it, ]$MissionClosure_HW) > 
+        (pareto_df[pareto_df$Iteration == last_it, ]$MissionClosure + pareto_df[pareto_df$Iteration == last_it, ]$MissionClosure_HW)) {
+      close_dif[i] <- TRUE
+      last_it <- it
+    } else {close_dif[i] <- FALSE}
+  }
+}
+
+cost_dif <- c()
+i <- 0
+for (it in rev(pareto_df$Iteration)) {
+  i <- i + 1
+  if (i == 1) {
+    cost_dif[i] <- TRUE
+    last_it <- it
+  } 
+  else {
+    if ((pareto_df[pareto_df$Iteration == it, ]$MissionCost - pareto_df[pareto_df$Iteration == it, ]$MissionCost_HW) > 
+        (pareto_df[pareto_df$Iteration == last_it, ]$MissionCost + pareto_df[pareto_df$Iteration == last_it, ]$MissionCost_HW)) {
+      cost_dif[i] <- TRUE
+      last_it <- it
+    } else {cost_dif[i] <- FALSE}
+  }
+}
+cost_dif <- rev(cost_dif)
+
+pareto_df <- cbind(pareto_df, close_dif)
+pareto_df <- cbind(pareto_df, cost_dif)
+
+
+# Plot closure time of non-dominated solutions with CI's
+ggplot(pareto_df, aes(x = factor(Iteration, levels = Iteration[order(MissionClosure)]), y = MissionClosure, color = close_dif)) +
+  geom_point() +
+  scale_color_manual(values = c("#FC4E07", "#00AFBB")) +
+  geom_errorbar(aes(ymax = (MissionClosure + MissionClosure_HW), ymin = (MissionClosure - MissionClosure_HW))) +
+  xlab('Iteration') + ylab('Closure Time (days)') + labs(color = "Best Statistically Different Solution") + theme(legend.position = "top") + theme(text = element_text(size = 13))
+
+# Plot cost of non-dominated solutions with CI's
+ggplot(pareto_df, aes(x = factor(Iteration, levels = Iteration[order(MissionCost)]), y = MissionCost, color = cost_dif)) + 
+  geom_point() +
+  scale_color_manual(values = c("#FC4E07", "#00AFBB")) +
+  geom_errorbar(aes(ymax = (MissionCost + MissionCost_HW), ymin = (MissionCost - MissionCost_HW))) +
+  xlab('Iteration') + ylab('Cost ($)')+ labs(color = "Best Statistically Different Solution") + theme(legend.position = "top") + theme(text = element_text(size = 13))
+```
+
+
+Let's visualize the solutions with their CI's in both dimensions at once. Each point will have an ellipse with radii defined by the half-width in each response dimension. Here, we can see the clusters that were determined earlier as well as the significance of each point in the cluster.
+```{r}
+# Plot cost vs closure time with CI ellipses
+clstr_plt <- ggplot(clusters_df, aes(x = MissionClosure, y = MissionCost, color = factor(clusters))) +
+              geom_point() +
+              geom_text(aes(label = Iteration), show.legend = FALSE, position = position_dodge(width = 0.1), hjust = -0.25, vjust = -0.25) +
+              geom_ellipse(aes(x0 = MissionClosure, y0 = MissionCost, a = MissionClosure_HW, b = MissionCost_HW, angle = 0)) +
+              xlab('Closure Time (days)') + ylab('Cost ($)') + labs(color = 'Cluster') + ggtitle("Cost vs. Closure Time (w/ CI's)") + theme(text = element_text(size = 13))
+suppressWarnings(print(clstr_plt))
+```
+
+
+After considering the confidence intervals, there are fewer than 11 truly unique solutions. There is no solution that is statistically unique in both closure time and cost. Depending on whether statistical difference is framed in terms of closure time or cost, the best solutions change. For example, iteration 77 is not statistically different from iteration 157 in terms of closure time or cost. They are both part of a group that is different from the rest of the solutions. If closure time is given priority, iteration 77 is the best choice for that group; however, if cost is given priority iteration 157 is the best choice from the group. A more practical approach to identifying good and unique solutions (along at least one dimension) could be as follows:
+  
+  1. Start with the solution with the fastest closure time.
+  
+  2. Select the most affordable solution that is not statistically different from the fastest solution in terms of closure time.
+  
+  3. Move to the next group of indifferent solutions in terms of closure time.
+  
+  4. Select the most affordable option in this group.
+  
+  5. Repeat 3 & 4 until all groups of indifferent solutions (in terms of closure time) have been considered.
+  
+  6. Now start with cheapest solution.
+  
+  7. Select the fastest solution that is not statistically different from the cheapest solution in terms of cost.
+  
+  8. Move to the next group of indifferent solutions in terms of cost.
+  
+  9. Select the fastest option in this group.
+  
+  10. Repeat 8 & 9 until all groups of indifferent solutions (in terms of cost) have been considered.
+  
+  11. Recommend the selected solutions.
+
+The code below automates this decision process and outputs the selected solutions.
+```{r}
+# Automate selection
+# Closure time dimension
+select_close <- c()
+for (i in 1:nrow(pareto_df)) {
+  if (i == 1) {
+    best_sol <- i
+  } else {
+    if (pareto_df[i, "close_dif"] == FALSE) {
+      if (pareto_df[i, "MissionCost"] < pareto_df[best_sol, "MissionCost"]) {
+        best_sol <- i
+      }
+    } else {
+      select_close <- append(select_close, pareto_df[best_sol, "Iteration"])
+      best_sol <- i
+    }
+    if (i == nrow(pareto_df)) {
+      select_close <- append(select_close, pareto_df[best_sol, "Iteration"])
+    }
+  }
+}
+
+# Cost dimension
+select_cost <- c()
+for (i in 0:(nrow(pareto_df)-1)) {
+  if (i == 0) {
+    best_sol <- i
+  } else {
+    if (pareto_df[(nrow(pareto_df)-i), "cost_dif"] == FALSE) {
+      if (pareto_df[(nrow(pareto_df)-i), "MissionClosure"] < pareto_df[(nrow(pareto_df)-best_sol), "MissionClosure"]) {
+        best_sol <- i
+      }
+    } else {
+      select_cost <- append(select_cost, pareto_df[(nrow(pareto_df)-best_sol), "Iteration"])
+      best_sol <- i
+
+    }
+    if (i == nrow(pareto_df)-1) {
+      select_cost <- append(select_cost, pareto_df[(nrow(pareto_df)-best_sol), "Iteration"])
+    }
+  }
+}
+
+print(paste(c("Selected solutions from closure time groups:", select_close), collapse = " ", sep = ""))
+print(paste(c("Selected solutions from cost groups:", select_cost), collapse = " ", sep = ""))
+```
+
+```{r}
+# Combine selections and remove duplicates
+select_all <- c(select_close, select_cost)
+select_unique <- unique(select_all)
+print(paste(c("Unique solutions:", select_unique), collapse = " ", sep = ""))
+```
+
+Following this decision process, the following solutions would be recommended as good, unique solutions (in order of increasing closure time and decreasing cost):
+
+  * 14 (1 C-5, 2 C-17s)
+  
+  * 118 (2 C-17s)
+  
+  * 141\* (2 C-17s, 1 A-90T-3)
+  
+  * 27 (1 C-17, 2 A-90T-3s)
+  
+  * 106 (2 C-17s, 2 A-90T-4s) [High level of unused assets]
+  
+  * 81 (1 C-17, 2 A-90T-4s)
+  
+  * 77 (2 A-180T-4s)
+  
+  * 157 (2 A-90T-4s)
+  
+\* Indicates solution was selected in both dimensions
+  
+Final takeaways:
+
+* Cluster 1 contains the most cost-efficient solutions. Only airships comprise the fleets in this cluster.
+
+* The most cost-efficient solution uses A-90T-4s. This is tied for the most-common airship across solutions.
+
+* The most common airships across solutions are the A-90T-3 and A-90T-4.
+
+* Cluster 2 contains the most effective solutions (fastest closure times). Every one of these solutions contains a C-17.
+
+* The fastest solution is a fleet of 1 C-5 and 2 C-17s.
+
+* Every fleet in Cluster 3 contains a C-17 and either a 90T-3 or 90T-4 airship.
+
+* If the point of this analysis were to determine if a single airship class could fill a gap or provide novel utility, the 90T class fills a speed vs. cost gap when mixed with traditional assets (Cluster 3), and the -4 also provides the lowest-cost solution in the mission scenario when utilized on its own (Cluster 1, Iteration 157). The 180T class also presents some usefulness; the -4 also offers a "time-conscious" alternative to the minimum cost option (Cluster 1, Iteration 77).
+
+* The clusters do a good job of categorizing the mission profile each fleet mix offers. Both fleet mixes from Cluster 1 were identified as good solutions (77 & 157). Two fleet mixes from Cluster 2 were identified as good solutions (14, 118). Finally, four solutions from Cluster 3 were identified as a good solutions (141, 27, 106, 81); all of these solutions include a 90T airship paired with a C-17(s). Cluster 3 is good evidence that a balanced profile can be achieved by combining traditional assets and airships--a 90T airship in this case. 
+
+* The -3 and -4 configurations of the airships are slow-speed, high-cargo configurations, using 80% of their payload for cargo and flying at 63 and 50 knots, respectively. Sacrificing fuel for cargo seems to be a good trade for missions defined by short range, light lift, and short trucking. This is likely because it saves extra trips that need to be taken by airships carrying less cargo. The low speed offers significant cost savings; in this mission, higher airship speed is not useful since the C-5 and C-17 are so much faster and distance is short (for transit and trucking).
